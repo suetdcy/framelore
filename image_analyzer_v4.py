@@ -78,7 +78,7 @@ def parse_geometry_with_confidence(roi):
         return 0, [x, y, w, h], "high", 0.0
     
     # 顶点数 > 4：存在曲线段 → 对四角区域做最小二乘圆拟合
-    corner_radii, errors = _fit_corner_circles(main_contour, x, y, w, h)
+    corner_radii, errors = _fit_corner_circles(main_contour, x, y, w, h, peri)
     
     if not corner_radii:
         # 四角均无可拟合圆 → 形状非圆角矩形，报 low
@@ -98,11 +98,15 @@ def parse_geometry_with_confidence(roi):
     return avg_radius, [x, y, w, h], conf, round(avg_rmse, 4)
 
 
-def _fit_corner_circles(contour, x, y, w, h):
+def _fit_corner_circles(contour, x, y, w, h, peri):
     """对轮廓四角区域分别拟合圆，返回半径列表和 RMSE 列表。"""
     corner_radii = []
     errors = []
-    corner_zone = int(min(w, h) * 0.35)
+    # 自适应 zone：弧长偏离度越大 → 圆角占比越大 → zone 越宽
+    rect_peri = 2 * (w + h)
+    deviation = max(0.0, peri - rect_peri) / max(1.0, rect_peri)
+    zone_ratio = max(0.10, min(0.40, deviation * 1.2))
+    corner_zone = int(min(w, h) * zone_ratio)
     corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
     
     for cx, cy in corners:
@@ -134,6 +138,29 @@ def _fit_corner_circles(contour, x, y, w, h):
     return corner_radii, errors
 
 # --- 渐变拟合（核心重构：自适应前置色彩孤立） ---
+def _estimate_gradient_angle(roi_gray):
+    """Sobel 梯度方向加权直方图 → 真实渐变角度（对齐 15° 步长）"""
+    gx = cv2.Sobel(roi_gray, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(roi_gray, cv2.CV_64F, 0, 1, ksize=3)
+    
+    mag = np.sqrt(gx**2 + gy**2)
+    angle = np.arctan2(gy, gx) * 180 / np.pi % 180  # [0, 180)
+    
+    mag_flat = mag.flatten()
+    angle_flat = angle.flatten()
+    threshold = np.percentile(mag_flat, 70)  # 取梯度幅值 top 30%
+    mask = mag_flat >= threshold
+    
+    if not mask.any():
+        return "180deg"  # 无显著梯度 → 默认垂直
+    
+    angles = angle_flat[mask]
+    hist, bins = np.histogram(angles, bins=36, range=(0, 180))
+    dominant = bins[np.argmax(hist)] + 2.5  # bin center
+    snapped = round(dominant / 15) * 15
+    if snapped >= 180: snapped -= 180
+    return f"{snapped}deg"
+
 def analyze_gradient_with_confidence(roi, accent_ratio_threshold: float = 0.3):
     h, w, _ = roi.shape
     roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
@@ -169,7 +196,7 @@ def analyze_gradient_with_confidence(roi, accent_ratio_threshold: float = 0.3):
         grad_type = "radial"
     elif row_var > EngineConfig.GRADIENT_LINEAR_LIMIT or col_var > EngineConfig.GRADIENT_LINEAR_LIMIT:
         grad_type = "linear"
-        direction = "180deg" if row_var > col_var else "90deg"
+        direction = _estimate_gradient_angle(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))
         
     if grad_type == "solid":
         # 修复一验证：如果是纯色，只对提纯后的色彩像素求平均，拒绝死黑背景稀释
@@ -190,23 +217,51 @@ def analyze_gradient_with_confidence(roi, accent_ratio_threshold: float = 0.3):
     elif kmeans.inertia_ / len(target_pixels) > EngineConfig.KMEANS_INERTIA_MEDIUM: color_confidence = "medium"
         
     centers = kmeans.cluster_centers_
-    labels_2d = kmeans.labels_ if not has_isolated_chroma else None
+    # 空间坐标：非孤立模式用 2D labels，孤立模式需重建
+    if has_isolated_chroma:
+        coords_2d_chromatic = np.argwhere(chromatic_mask)  # (N, 2) [row, col] 对应 chromatic_pixels 的每行
+        labels_2d = None  # 使用 1D labels + coords_2d_chromatic
+    else:
+        labels_2d = kmeans.labels_.reshape(h, w)
+        coords_2d_chromatic = None
+    
+    # 渐变方向向量（用于线性定位投影）
+    ang_str = grad_type == "linear" and direction.replace("deg", "") or "180"
+    try:
+        ang = float(ang_str) * np.pi / 180
+    except ValueError:
+        ang = np.pi  # 180deg 默认
+    d_row, d_col = -np.cos(ang), np.sin(ang)  # y 向下
+    
     stops = []
     
     for i in range(n_clusters):
-        if has_isolated_chroma:
-            pos = (i / max(1, n_clusters - 1)) * 100
-            cluster_size = np.sum(kmeans.labels_ == i)
+        # 获取该聚类的空间坐标
+        if coords_2d_chromatic is not None:
+            mask_i = kmeans.labels_ == i
+            coords = coords_2d_chromatic[mask_i]
         else:
             coords = np.argwhere(labels_2d == i)
-            if len(coords) == 0: continue
-            if grad_type == "radial":
-                cy, cx = h / 2, w / 2
-                dists = np.sqrt((coords[:, 0] - cy)**2 + (coords[:, 1] - cx)**2)
-                pos = np.mean(dists) / (np.sqrt(cy**2 + cx**2) or 1) * 100
+        
+        if len(coords) == 0: continue
+        
+        if grad_type == "linear":
+            # 空间质心投影到渐变方向
+            centroid = np.mean(coords, axis=0)
+            proj = centroid[0] * d_row + centroid[1] * d_col
+            # 同类所有像素的投影值范围做归一化
+            proj_all = coords[:, 0] * d_row + coords[:, 1] * d_col
+            p_min, p_max = proj_all.min(), proj_all.max()
+            if p_max - p_min > 0:
+                pos = (proj - p_min) / (p_max - p_min) * 100
             else:
-                pos = np.mean(coords[:, 0]) / h * 100 if direction == "180deg" else np.mean(coords[:, 1]) / w * 100
-            cluster_size = len(coords)
+                pos = 50  # 单色团回退到中间
+        else:  # radial
+            cy, cx = h / 2, w / 2
+            dists = np.sqrt((coords[:, 0] - cy)**2 + (coords[:, 1] - cx)**2)
+            pos = np.mean(dists) / (np.sqrt(cy**2 + cx**2) or 1) * 100
+        
+        cluster_size = len(coords)
         
         color = centers[i]
         if is_dark_mode:
@@ -397,13 +452,15 @@ async def scan_global(request: ScanGlobalRequest):
     
     contours, hierarchy = cv2.findContours(edged, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     detected_components = []
-    if hierarchy is None: return {"status": "success", "components": []}
+    if hierarchy is None: return {"status": "success", "components": [], "total_detected": 0, "filtered_count": 0}
     hierarchy = hierarchy[0]
     
+    # 第一遍：收集所有候选（含噪声），记录原始索引 → 保留/丢弃决策
+    candidates = []  # (orig_idx, parent_orig_idx, component_dict, keep_bool)
     for i, cnt in enumerate(contours):
         x, y, w, h = cv2.boundingRect(cnt)
         if w > EngineConfig.MIN_COMPONENT_SIZE and h > EngineConfig.MIN_COMPONENT_SIZE:
-            parent_idx = int(hierarchy[i][3])
+            parent_orig_idx = int(hierarchy[i][3])
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.015 * peri, True)
             
@@ -412,20 +469,57 @@ async def scan_global(request: ScanGlobalRequest):
             ymax_norm = int((y + h) / h_img * 1000)
             xmax_norm = int((x + w) / w_img * 1000)
             
-            # 面积噪声过滤：小于 0.3% 视口且无父容器 → 丢弃
+            # 面积噪声判定
             area_norm = (ymax_norm - ymin_norm) * (xmax_norm - xmin_norm)
             area_ratio = area_norm / 1_000_000
-            if area_ratio < EngineConfig.MIN_COMPONENT_AREA_RATIO and parent_idx == -1:
-                continue
+            is_noise = (area_ratio < EngineConfig.MIN_COMPONENT_AREA_RATIO and parent_orig_idx == -1)
             
-            detected_components.append({
-                "id": f"comp_{i}",
-                "bbox": [ymin_norm, xmin_norm, ymax_norm, xmax_norm],  
-                "parent_id": f"comp_{parent_idx}" if parent_idx != -1 else "root",
-                "maybe_rounded": len(approx) > 4
+            # 启发式类型标注
+            aspect = w / max(1, h) if w > 0 and h > 0 else 1.0
+            if area_ratio >= 0.05:
+                hint = "container"
+            elif area_ratio >= 0.005:
+                hint = "card" if 0.5 < aspect < 2.0 else "banner"
+            elif 0.3 < aspect < 3.0:
+                hint = "text" if area_ratio >= 0.001 else "icon"
+            else:
+                hint = "border"
+            
+            candidates.append({
+                "orig_idx": i,
+                "parent_orig": parent_orig_idx if parent_orig_idx != -1 else None,  # None = root
+                "comp": {
+                    "bbox": [ymin_norm, xmin_norm, ymax_norm, xmax_norm],
+                    "maybe_rounded": len(approx) > 4,
+                    "hint_type": hint
+                },
+                "keep": not is_noise
             })
+    
+    # 建立索引映射：原索引 → 新索引（仅保留项）
+    keep_indices = {c["orig_idx"]: new_idx for new_idx, c in enumerate([x for x in candidates if x["keep"]])}
+    filtered_count = sum(1 for c in candidates if not c["keep"])
+    
+    # 第二遍：重映射 parent_id
+    for c in candidates:
+        if not c["keep"]:
+            continue
+        if c["parent_orig"] is None:
+            parent_id = "root"
+        elif c["parent_orig"] in keep_indices:
+            parent_id = f"comp_{keep_indices[c['parent_orig']]}"
+        else:
+            # 父节点被过滤 → 提升到 root
+            parent_id = "root"
+        
+        detected_components.append({
+            "id": f"comp_{keep_indices[c['orig_idx']]}",
+            **c["comp"],
+            "parent_id": parent_id
+        })
             
-    return {"status": "success", "total_detected": len(detected_components), "components": detected_components}
+    return {"status": "success", "total_detected": len(detected_components),
+            "filtered_count": filtered_count, "components": detected_components}
 
 # --- 字体大小估算（形态学 + 轮廓分析，无 OCR 依赖） ---
 class DetectTextRequest(BaseModel):
