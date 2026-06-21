@@ -10,12 +10,12 @@ FrameLore 是一个基于多模态视觉模型 + 本地物理测量工具的 UI 
 │  qwen-vl-max / gpt-4o / doubao-vision               │
 │  语义识别 · 布局意图分流 · 组件树构建 · UX 推断      │
 └──────┬───────────────────────────────────────────────┘
-       │ 调用 POST /analyze_region, /measure_spacing, /scan_global
+       │ 调用 POST /analyze_region, /measure_spacing, /scan_global, /detect_text
        ▼
 ┌──────────────────────────────────────────────────────┐
 │              外周工具层（image-analyzer）              │
 │  本地 Python 服务 · OpenCV 像素级量化                │
-│  色值 · 圆角 · 阴影 · 间距 · 轮廓拓扑树              │
+│  色值 · 圆角 · 间距 · 字体 · 轮廓拓扑树              │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -46,7 +46,7 @@ pip install fastapi uvicorn opencv-python numpy scikit-learn requests
 #### 启动
 
 ```bash
-python .deepseek-orca/skills/framelore/image_analyzer_v4.py
+python image_analyzer_v4.py
 ```
 
 服务默认运行在 `http://127.0.0.1:8000`，提供四个端点：
@@ -84,7 +84,7 @@ Design System 提取 → 交叉校验 → CHECKPOINT → 写入文件
 ## 输出
 
 - 报告文件：`framelore-output/FrameLore-{素材名}-{YYYYMMDD-HHmmss}.md`
-- 可选 HTML：根据报告强约束值生成还原页面
+- 可选 HTML：仅用于视觉验证（比对原图与报告数据），不作为主要交付物
 
 ## 关联
 
@@ -150,7 +150,7 @@ Copy-Item "中文路径/图片.png" $tmp -Force
 
 **原因**：多模态模型在全局语义聚类时，误将灰色非激活标签页文本识别为页面元数据。
 
-**解决**：在预处理时裁剪浏览器头部区域（外周物理层），辅以 Hidden Invariant 规则拦截。详见 SKILL.md 第四步和 Hidden Invariant #8。
+**解决**：在预处理时裁剪浏览器头部区域（外周物理层），辅以 SKILL.md 中的「报告输出红线」规则拦截。
 
 ---
 
