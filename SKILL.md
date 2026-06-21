@@ -32,11 +32,13 @@ FrameLore 采用 **「VLM 语义锚定 + CV 物理探针」** 的双驱解耦架
 |------|---------|--------------|
 | `POST /analyze_region` (mode=kmeans) | `{image_source, bbox, mode}` <br>⚠️ *`bbox` 为 [ymin, xmin, ymax, xmax] 归一化空间* | K-Means 聚类提取背景主色/渐变分布，适合容器底色大面积区域。|
 | `POST /analyze_region` (mode=peak_accent) | 同上 | 饱和度 Top 5% 极值强调色提取，适合独立高亮控件（Badge/Tag/按钮）。|
+| `POST /analyze_region` (mode=palette) | `{image_source}` | 全图 HSV KMeans 调色板提取（n=6，滤 <2% 色团）。仅用于全局 Design System 校验和漏检警告，不参与组件树颜色填充。|
 | `POST /measure_spacing` | `{bboxes:[[ymin, xmin, ymax, xmax], ...]}` | 物理间距计算，返回中位数间距、标准差及置信度。|
 | `POST /scan_global` | `{image_path}` | 全局轮廓检测，返回扁平组件列表（含 bbox、parent_id 层级关系）。已内置面积噪声过滤（< 0.3% 视口且无父容器的碎片自动丢弃）。|
 | `POST /detect_text` | `{image_source, bbox?}` | MSER 字符候选区提取 + 空间行分组，返回 heading/body/caption 字号区间（px）及每行高度列表。|
 | `POST /detect_overlay` | `{image_source}` | 全局直方图统计矩分析，检测半透明遮罩/弹窗/骨架屏。返回 overlay 存在性 + modal bbox 列表。|
 | `POST /fix_hierarchy` | `{components}` | 基于 IoA（交集占子节点面积比）修正 OpenCV hierarchy 的 parent_id 错误，返回修正后扁平列表 + 嵌套 children 树。|
+| `POST /draw_labels` | `{image_source, components}` | Set-of-Mark 打点图：在 scan_global 组件上画编号红框，返回 base64 PNG。VLM 看图报编号，后端按编号取精确 bbox。|
 
 **OCR 分工**：`/detect_text` 仅提供字号区间（物理量），不识别文字内容。所有 UI 文字内容由 VLM vision API（qwen-vl-max / gpt-4o）的 `content[0].text` 直接提取。两路数据独立，各不互扰。
 
@@ -146,6 +148,27 @@ FrameLore 采用 **「VLM 语义锚定 + CV 物理探针」** 的双驱解耦架
 
 ---
 
+## 🎯 Set-of-Mark 靶向提取协议 (SoM Protocol)
+
+当 scan_global 未能捕获特定强调色控件（如 Canny 在暗黑模式下漏扫红色 Badge），不得回退到 LLM "猜测坐标"。执行以下三步：
+
+1. **CV 打点**：调用 `POST /draw_labels`，传入 `scan_global` 的 components 数组，获得带编号红框的 base64 底图。
+2. **VLM 选号**：将打点图发给 VLM，提问「那个写着 08 的红色方块是第几号框？」。VLM 只报编号，不猜坐标。
+3. **精确定位**：用 VLM 返回的编号索引 `scan_global` components 数组，取其 `bbox` 传入 `POST /analyze_region (mode=peak_accent)`。
+
+**约束**：SoM 仅用于 scan_global 漏检的回退场景。已捕获的控件直接用 scan_global 的 bbox。
+
+### 🎨 全局调色板契约 (Palette Contract)
+
+`mode="palette"` 返回全图 HSV KMeans 调色板。其唯一用途：
+
+- 作为 Design Token 的全局参考数组填入报告第 2 段
+- LLM 自检：若 palette 检测到高频色（如 8% 红色）但组件树中无红色控件，在 Rule Telemetry 中输出 `[WARNING: Palette-Leak-Detected]`
+
+**严禁**：用 palette 色值填充任何组件树节点的 `background_color` 或 `peak_accent_hex`。组件颜色必须来自 `mode="peak_accent"` 的局部提取。
+
+---
+
 ## 🖱️ UX 交互层提取规则
 
 从已获得的物理数据出发，按以下映射表推断 UX 层级。每一项都绑定具体工具返回值——**LLM 看到什么物理数据，就填什么 UX 结论**，无数据直接降级为 `[]` 或 `null`。
@@ -199,6 +222,9 @@ design_tokens:
       - hex: "{独立提取的 Hex 2 (若有)}"
         role: "secondary/badge"
         confidence: "{confidence}"
+    
+    # mode=palette 全图调色板 — 仅用于漏检警告，不填充组件树
+    global_palette: [{hex: "#...", ratio: 0.XX}, ...]
   
   typography_tokens:
     heading_range: "{/detect_text 返回的 heading_range}"

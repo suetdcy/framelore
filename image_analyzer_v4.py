@@ -402,8 +402,8 @@ def peak_accent_extraction(roi):
 
 class AnalyzeRegionRequest(BaseModel):
     image_source: str
-    bbox: list[int]  
-    mode: str = "kmeans"  # "kmeans" (full analysis) or "peak_accent" (top 5% saturation)
+    bbox: Optional[list[int]] = None  # palette 模式不需要
+    mode: str = "kmeans"  # "kmeans" | "peak_accent" | "palette"
     accent_ratio_threshold: float = 0.3
 
 class MeasureSpacingRequest(BaseModel):
@@ -418,14 +418,38 @@ async def analyze_region(request: AnalyzeRegionRequest):
     img = load_image(request.image_source)
     h_img, w_img, _ = img.shape
     
-    # 输入校验：bbox 必须为 [ymin, xmin, ymax, xmax] 且值在 [0, 1000]
-    if len(request.bbox) != 4 or not all(0 <= v <= 1000 for v in request.bbox):
-        raise HTTPException(status_code=400, detail="bbox must be [ymin, xmin, ymax, xmax] in [0, 1000]")
-    ymin_norm, xmin_norm, ymax_norm, xmax_norm = request.bbox
+    # 输入校验：非 palette 模式需校验 bbox
+    if request.mode != "palette":
+        if not request.bbox or len(request.bbox) != 4 or not all(0 <= v <= 1000 for v in request.bbox):
+            raise HTTPException(status_code=400, detail="bbox must be [ymin, xmin, ymax, xmax] in [0, 1000]")
+        ymin_norm, xmin_norm, ymax_norm, xmax_norm = request.bbox
     ymin = int(ymin_norm / 1000.0 * h_img)
     xmin = int(xmin_norm / 1000.0 * w_img)
     ymax = int(ymax_norm / 1000.0 * h_img)
     xmax = int(xmax_norm / 1000.0 * w_img)
+    
+    # palette 模式：全图分析，不需要 ROI
+    if request.mode == "palette":
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        hsv_f = hsv.reshape(-1, 3)
+        chroma_mask = (hsv_f[:, 1] > 30) & (hsv_f[:, 2] > 25)
+        if not chroma_mask.any():
+            return {"status": "success", "mode": "palette", "palette": []}
+        chroma_pixels = hsv_f[chroma_mask]
+        n = min(6, len(np.unique(chroma_pixels, axis=0)))
+        kmeans = KMeans(n_clusters=n, n_init=5, random_state=42)
+        kmeans.fit(chroma_pixels)
+        counts = np.bincount(kmeans.labels_)
+        total = counts.sum()
+        palette = []
+        for i in range(n):
+            h, s, v = kmeans.cluster_centers_[i]
+            ratio = counts[i] / total
+            if ratio >= 0.02:
+                color_bgr = cv2.cvtColor(np.uint8([[[h, s, v]]]), cv2.COLOR_HSV2BGR)[0, 0]
+                hex_c = '#{:02x}{:02x}{:02x}'.format(int(color_bgr[2]), int(color_bgr[1]), int(color_bgr[0]))
+                palette.append({"hex": hex_c, "ratio": round(ratio, 3)})
+        return {"status": "success", "mode": "palette", "palette": palette}
     
     roi = img[max(0, ymin):min(ymax, h_img), max(0, xmin):min(xmax, w_img)]
     if roi.size == 0: raise HTTPException(status_code=400, detail="区域映射失败，ROI 为空。")
@@ -455,7 +479,7 @@ async def analyze_region(request: AnalyzeRegionRequest):
                 "color_gradient_confidence": peak_conf
             }
         }
-        
+    
     radius, geo_box, radius_conf, radius_err = parse_geometry_with_confidence(roi)
     color_info = analyze_gradient_with_confidence(roi, request.accent_ratio_threshold)
     shadow_blur, shadow_conf = _detect_shadow_dog(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))
@@ -893,6 +917,41 @@ async def fix_hierarchy(request: FixHierarchyRequest):
             "correction_details": [{"id": c["id"], "original_parent": c.get("original_parent_id"),
                                     "new_parent": c["parent_id"], "ioa_score": c.get("ioa_score")}
                                    for c in comps if "original_parent_id" in c]}
+
+
+# --- Set-of-Mark 打点图生成 ---
+class DrawLabelsRequest(BaseModel):
+    image_source: str
+    components: list[dict]  # scan_global 的 components 数组
+    max_labels: int = 50    # 标注数量上限
+
+
+@app.post("/draw_labels")
+async def draw_labels(request: DrawLabelsRequest):
+    """在原图上画出 scan_global 组件的编号框图，返回 base64 PNG。
+    VLM 看图报编号，后端按编号取精确 bbox。"""
+    img = load_image(request.image_source)
+    h_img, w_img, _ = img.shape
+    
+    overlay = img.copy()
+    for i, comp in enumerate(request.components[:request.max_labels]):
+        norm_bbox = comp["bbox"]
+        ymin = int(norm_bbox[0] / 1000.0 * h_img)
+        xmin = int(norm_bbox[1] / 1000.0 * w_img)
+        ymax = int(norm_bbox[2] / 1000.0 * h_img)
+        xmax = int(norm_bbox[3] / 1000.0 * w_img)
+        
+        # 画框（亮红色，2px）
+        cv2.rectangle(overlay, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
+        # 标编号（红色大字，白色描边可读）
+        label = str(i)
+        pos = (xmin + 4, ymin + 24)
+        cv2.putText(overlay, label, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 3)
+        cv2.putText(overlay, label, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+    
+    _, buf = cv2.imencode(".png", overlay)
+    b64 = base64.b64encode(buf).decode()
+    return {"status": "success", "image_base64": b64, "labeled_count": min(len(request.components), request.max_labels)}
 
 
 if __name__ == "__main__":
