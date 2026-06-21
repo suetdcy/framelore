@@ -68,6 +68,21 @@ def parse_geometry_with_confidence(roi):
     
     main_contour = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(main_contour)
+    main_area = cv2.contourArea(main_contour)
+    roi_area = roi.shape[0] * roi.shape[1]
+    
+    # 面积合理性校验：暗黑模式下 OTSU 可能将 #111 卡片与 #000 背景混淆
+    if main_area < roi_area * 0.5 and float(np.mean(gray)) < 85.0:
+        # 自适应阈值重试
+        adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                          cv2.THRESH_BINARY, 31, 4)
+        adapt_contours, _ = cv2.findContours(adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if adapt_contours:
+            adapt_main = max(adapt_contours, key=cv2.contourArea)
+            adapt_area = cv2.contourArea(adapt_main)
+            if adapt_area > main_area * 1.5:  # 自适应找到了更大的轮廓 → 更可靠
+                main_contour = adapt_main
+                x, y, w, h = cv2.boundingRect(main_contour)
     
     # --- 轮廓曲率分析：判断是否存在圆角 ---
     peri = cv2.arcLength(main_contour, True)
@@ -271,7 +286,7 @@ def analyze_gradient_with_confidence(roi, accent_ratio_threshold: float = 0.3):
     centers = kmeans.cluster_centers_
     # 空间坐标：非孤立模式用 2D labels，孤立模式需重建
     if has_isolated_chroma:
-        coords_2d_chromatic = np.argwhere(chromatic_mask)  # (N, 2) [row, col] 对应 chromatic_pixels 的每行
+        coords_2d_chromatic = np.column_stack([np.argwhere(chromatic_mask)[:, 0] // w, np.argwhere(chromatic_mask)[:, 0] % w])  # 1D 展开索引 → 2D (row, col)
         labels_2d = None  # 使用 1D labels + coords_2d_chromatic
     else:
         labels_2d = kmeans.labels_.reshape(h, w)
@@ -393,6 +408,7 @@ class AnalyzeRegionRequest(BaseModel):
 
 class MeasureSpacingRequest(BaseModel):
     bboxes: list[list[int]]
+    direction: str = "auto"  # "auto" = 双向, "x" = 仅水平, "y" = 仅垂直
 
 class ScanGlobalRequest(BaseModel):
     image_path: str
@@ -416,7 +432,18 @@ async def analyze_region(request: AnalyzeRegionRequest):
     
     # mode 路由：peak_accent 仅提取强调色，跳过全量分析
     if request.mode == "peak_accent":
-        peak_hex, peak_conf = peak_accent_extraction(roi)
+        # 自动裁剪 ROI 中心 60% 区域，排除 LLM 框选边缘的相邻元素污染
+        h_roi, w_roi = roi.shape[:2]
+        cy, cx = h_roi // 2, w_roi // 2
+        crop_h, crop_w = int(h_roi * 0.6), int(w_roi * 0.6)
+        y_start = max(0, cy - crop_h // 2)
+        y_end = min(h_roi, cy + crop_h // 2)
+        x_start = max(0, cx - crop_w // 2)
+        x_end = min(w_roi, cx + crop_w // 2)
+        cropped = roi[y_start:y_end, x_start:x_end]
+        if cropped.size == 0:
+            cropped = roi
+        peak_hex, peak_conf = peak_accent_extraction(cropped)
         return {
             "status": "success",
             "mode": "peak_accent",
@@ -458,21 +485,26 @@ async def analyze_region(request: AnalyzeRegionRequest):
 @app.post("/measure_spacing")
 async def measure_spacing(request: MeasureSpacingRequest):
     boxes = request.bboxes
+    direction = request.direction
+    
     if len(boxes) < 2:
         return {"status": "success", "suggested_gap_x": 0, "suggested_gap_y": 0,
                 "metrics_summary": {"gap_confidence": "high", "std_deviation_x": 0.0, "std_deviation_y": 0.0}}
     
     gaps_x = []
     gaps_y = []
-    bx = sorted(boxes, key=lambda b: b[1])  
-    by = sorted(boxes, key=lambda b: b[0])  
     
-    for i in range(len(bx) - 1):
-        gap = bx[i+1][1] - bx[i][3]  
-        if gap >= 0: gaps_x.append(gap)
-    for i in range(len(by) - 1):
-        gap = by[i+1][0] - by[i][2]  
-        if gap >= 0: gaps_y.append(gap)
+    if direction in ("auto", "x"):
+        bx = sorted(boxes, key=lambda b: b[1])
+        for i in range(len(bx) - 1):
+            gap = bx[i+1][1] - bx[i][3]
+            if gap >= 0: gaps_x.append(gap)
+    
+    if direction in ("auto", "y"):
+        by = sorted(boxes, key=lambda b: b[0])
+        for i in range(len(by) - 1):
+            gap = by[i+1][0] - by[i][2]
+            if gap >= 0: gaps_y.append(gap)
         
     std_x = float(np.std(gaps_x)) if gaps_x else 0.0
     std_y = float(np.std(gaps_y)) if gaps_y else 0.0
@@ -591,10 +623,10 @@ def _detect_text_mser(roi):
     diag = np.sqrt(h_roi**2 + w_roi**2)
     mser_delta = max(2, min(8, int(diag / 200)))  # δ ∈ [2, 8]
     
-    mser = cv2.MSER_create(_delta=mser_delta, _min_area=20, _max_area=int(diag * 0.8))
+    mser = cv2.MSER_create(delta=mser_delta, min_area=20, max_area=int(diag * 0.8))
     regions, _bboxes = mser.detectRegions(gray)
     
-    if not _bboxes:
+    if len(_bboxes) == 0:
         return {"heading_range": None, "body_range": None, "caption_range": None,
                 "per_line_heights": [], "line_count": 0, "confidence": "estimated"}
     
@@ -857,7 +889,10 @@ async def fix_hierarchy(request: FixHierarchyRequest):
             n["children"] = []
             tree.append(n)
     
-    return {"status": "success", "corrections": corrections, "components": comps, "tree": tree}
+    return {"status": "success", "corrections": corrections, "components": comps, "tree": tree,
+            "correction_details": [{"id": c["id"], "original_parent": c.get("original_parent_id"),
+                                    "new_parent": c["parent_id"], "ioa_score": c.get("ioa_score")}
+                                   for c in comps if "original_parent_id" in c]}
 
 
 if __name__ == "__main__":
