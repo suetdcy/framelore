@@ -5,3 +5,17 @@
 .env
 venv/
 .venv/
+
+# Editors
+.vscode/
+.idea/
+
+# Testing & linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging
+*.egg-info/
+dist/
+build/
