@@ -8,7 +8,7 @@ description: 从网页、截图等界面素材中，结构化提取 UI 视觉层
 ## 🧠 认知模型（叙事层）
 
 FrameLore 采用 **「VLM 语义锚定 + CV 物理探针」** 的双驱解耦架构。系统将大模型（VLM）视为具备设计常识的「语义切割器」，将底层 `image-analyzer` 视为纯粹客观的「物理量化仪」。
-本 Skill 的终极交付物是结构化、可被机器与解析脚本无脑读取的高精度 Markdown 数据库，严禁输出任何发散性的自然语言散文或直接编写 HTML/CSS 渲染代码。
+本 Skill 的终极交付物是结构化、可被机器与解析脚本无脑读取的高精度 Markdown 数据库。HTML 仅允许作为视觉验证产物输出（比对原图与报告数据的一致性），不得作为主要交付物替代 MD 报告。
 
 ## 触发规则
 
@@ -34,6 +34,7 @@ FrameLore 采用 **「VLM 语义锚定 + CV 物理探针」** 的双驱解耦架
 | `POST /analyze_region` (mode=peak_accent) | 同上 | 饱和度 Top 5% 极值强调色提取，适合独立高亮控件（Badge/Tag/按钮）。|
 | `POST /measure_spacing` | `{bboxes:[[ymin, xmin, ymax, xmax], ...]}` | 物理间距计算，返回中位数间距、标准差及置信度。|
 | `POST /scan_global` | `{image_path}` | 获取全域组件的边缘轮廓与物理绝对坐标树。|
+| `POST /detect_text` | `{image_source, bbox?}` | 形态学文字行检测，返回 heading/body/caption 字号区间（px）及原始高度列表。|
 
 ### 置信度数学定义
 
@@ -126,6 +127,36 @@ FrameLore 采用 **「VLM 语义锚定 + CV 物理探针」** 的双驱解耦架
 
 ---
 
+## 📋 scan_global 全量消费规则
+
+`POST /scan_global` 返回的 `components` 数组是组件树的**物理事实唯一来源**。大模型必须遵循以下消费规则：
+
+1. **全量保留**：`total_detected` 条组件必须全部包含在报告的 Component Tree 中，仅可剔除同时满足以下条件的噪声点：
+   - 面积 < 视口 1%（即 `(ymax - ymin) * (xmax - xmin) / 1,000,000 < 0.01`）
+   - 无子节点
+   - 未被 LLM 分配有效 `semantic_tag`
+2. **id / parent_id 原样转录**：使用 scan_global 返回的 `id` 和 `parent_id`，不得自行重编号。`parent_id: "root"` 的节点为顶层。
+3. **LLM 语义注入**：为每个节点补充 `semantic_tag`（如 "Card" / "Button" / "Badge" / "Section"）和 `content_text`（Strict-Copy 原文）。
+4. **样式按需探针**：仅对 `semantic_tag` 为关键控件（卡片/按钮/标签/Badge）的节点调用 `analyze_region` 获取 `computed_style`。其余节点 `computed_style` 可设为 `null`。
+5. **层级重建**：输出 JSON 时依据 `parent_id` 重建嵌套 `children` 数组，确保物理包裹关系与视觉一致。
+
+---
+
+## 🖱️ UX 交互层提取规则
+
+静态截图可提取的 UX 信息有限但可验证。仅提取**视觉可见**的交互线索，禁止推测不可见行为。
+
+1. **导航识别**：扫描顶部/侧边区域的导航控件，判定类型（Tab/Breadcrumb/SideNav/TopBar），记录当前激活项的文字。
+2. **弹窗/浮层**：检测页面内是否存在高 z-index 视觉特征（居中卡片+背景半透明遮罩、右滑抽屉、底部面板）。提取弹窗标题文字（Strict-Copy）。
+3. **状态指示器**：检测加载态（骨架屏 gray blocks / Spinner 图标 / 进度条）、空状态（居中图标+提示文字）、禁用态（灰色文字/降低对比度的控件）。
+4. **可点击计数**：统计按钮、链接、可点击卡片的总数。此计数来自 scan_global 组件经 LLM 分类后的汇总。
+
+**约束**：
+- 未检测到的字段填入空数组 `[]` 或 `null`，不得编造。
+- 不得推断「点击后跳转到某页面」——仅记录当前帧可见内容。
+
+---
+
 ## 🏁 终极交付物：高精度数据化 MD 报告模板
 
 大模型在完成推理与工具调用后，**必须且只能**输出以下结构化格式的 Markdown 数据 Dump，不得删减层级或篡改数据架构：
@@ -156,31 +187,33 @@ design_tokens:
       - hex: "{独立提取的 Hex 2 (若有)}"
         role: "secondary/badge"
         confidence: "{confidence}"
+  
+  typography_tokens:
+    heading_range: "{/detect_text 返回的 heading_range}"
+    body_range: "{/detect_text 返回的 body_range}"
+    caption_range: "{/detect_text 返回的 caption_range}"
+    confidence: "estimated"
 ```
 
 ## 3. DOM 级高精度组件树 (Component Tree)
 ```json
-// 必须严格输出嵌套层级，确保 parent_id 关系与 norm_bbox 物理包裹逻辑绝对吻合
+// 必须包含 scan_global 返回的全部组件（剔除面积 < 1% 视口的噪声点）。
+// 使用 scan_global 的 id / parent_id / bbox 构建嵌套层级，
+// LLM 为每个节点补充 semantic_tag 与 content_text。
 [
   {
-    "id": "node_01",
-    "parent_id": "root",
-    "semantic_tag": "Container",
-    "norm_bbox": [ymin, xmin, ymax, xmax],
+    "id": "comp_3",                       // scan_global 原始 id
+    "parent_id": "comp_1",                // scan_global 原始 parent_id
+    "semantic_tag": "Card",              // LLM 语义标注
+    "norm_bbox": [160, 120, 380, 340],   // scan_global 原始 bbox
     "computed_style": {
-      "border_radius": "{radius}px [Confidence: High/Medium/Low]",
-      "background_color": "{匹配到的底色}"
+      "border_radius": "10px [Confidence: High]",
+      "background_color": "#111111"
     },
-    "children": [
-      {
-        "id": "node_02",
-        "parent_id": "node_01",
-        "semantic_tag": "Button",
-        "norm_bbox": [ymin, xmin, ymax, xmax],
-        "content_text": "确 认" // Strict-Copy 严格保留原始空格或特殊符号
-      }
-    ]
+    "content_text": "Notion Skills",     // Strict-Copy 原文
+    "children": []                       // 由 parent_id 关系重建
   }
+  // ... 所有 scan_global 组件（约 {total_detected} 条，剔除面积 < 1% 的噪声）
 ]
 ```
 
@@ -188,6 +221,23 @@ design_tokens:
 ```yaml
 triggered_rules:
   - {根据执行链真实记录触发的隐含规则，如 Semantic-Cropping, Strict-Copy, Dark-Mode-Clamp}
+```
+
+## 5. UX 交互层提取 (UX Layer)
+```yaml
+ux_layer:
+  page_flow:
+    navigation_type: "{TopBar / SideNav / Tabs / Breadcrumb / 无}"
+    active_section: "{当前高亮的导航项名称}"
+  
+  interactive_states:
+    visible_modals: []       # 可见弹窗/抽屉列表（Strict-Copy 标题文字）
+    loading_indicators: []   # 骨架屏/Spinner/进度条
+    empty_states: []         # 空状态占位图文
+  
+  interaction_cues:
+    clickable_count: {int}   # 可点击控件总数（按钮+链接+卡片）
+    disabled_controls: []    # 灰色/不可用控件列表
 ```
 ```
 

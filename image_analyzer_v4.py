@@ -4,6 +4,7 @@ import requests
 import base64
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from typing import Optional
 from sklearn.cluster import KMeans
 import uvicorn
 
@@ -46,7 +47,7 @@ def load_image(source: str) -> np.ndarray:
     except Exception:
         raise HTTPException(status_code=400, detail="图像加载失败。")
 
-# --- 圆角精准度量 ---
+# --- 圆角精准度量（轮廓曲率分析） ---
 def parse_geometry_with_confidence(roi):
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -54,31 +55,73 @@ def parse_geometry_with_confidence(roi):
     
     if not contours:
         return 0, [0, 0, roi.shape[1], roi.shape[0]], "low", 1.0
-        
+    
     main_contour = max(contours, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(main_contour)
-    actual_area = cv2.contourArea(main_contour)
-    bounding_rect_area = w * h
-    area_delta = bounding_rect_area - actual_area
     
-    radius = 0
-    confidence = "high"
-    error_rate = 0.0
+    # --- 轮廓曲率分析：判断是否存在圆角 ---
+    peri = cv2.arcLength(main_contour, True)
+    approx = cv2.approxPolyDP(main_contour, 0.015 * peri, True)
     
-    if area_delta > 0:
-        estimated_r = np.sqrt(area_delta / (4 - np.pi))
-        radius = int(min(estimated_r, min(w, h) / 2))
-        if radius >= 2:
-            theoretical_delta = (4 - np.pi) * (radius ** 2)
-            error_rate = abs(theoretical_delta - area_delta) / max(1, area_delta)
-            if error_rate < 0.15: confidence = "high"
-            elif error_rate < 0.4: confidence = "medium"
-            else: confidence = "low"
-        else:
-            radius = 0
+    if len(approx) <= 4:
+        # 多边形顶点 ≤ 4：尖锐直角，无圆角
+        return 0, [x, y, w, h], "high", 0.0
+    
+    # 顶点数 > 4：存在曲线段 → 对四角区域做最小二乘圆拟合
+    corner_radii, errors = _fit_corner_circles(main_contour, x, y, w, h)
+    
+    if not corner_radii:
+        # 四角均无可拟合圆 → 形状非圆角矩形，报 low
+        return 0, [x, y, w, h], "low", 1.0
+    
+    avg_radius = int(np.mean(corner_radii))
+    avg_rmse = float(np.mean(errors))
+    
+    # RMSE → 置信度 (per SKILL.md spec)
+    if avg_rmse <= 0.5:
+        conf = "high"
+    elif avg_rmse <= 1.5:
+        conf = "medium"
     else:
-        confidence = "high"
-    return radius, [x, y, w, h], confidence, round(error_rate, 4)
+        conf = "low"
+    
+    return avg_radius, [x, y, w, h], conf, round(avg_rmse, 4)
+
+
+def _fit_corner_circles(contour, x, y, w, h):
+    """对轮廓四角区域分别拟合圆，返回半径列表和 RMSE 列表。"""
+    corner_radii = []
+    errors = []
+    corner_zone = int(min(w, h) * 0.35)
+    corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+    
+    for cx, cy in corners:
+        pts = []
+        for pt in contour:
+            px, py = pt[0]
+            if abs(px - cx) <= corner_zone and abs(py - cy) <= corner_zone:
+                pts.append([px, py])
+        
+        if len(pts) < 5:
+            continue
+        
+        pts_arr = np.array(pts, dtype=np.float64)
+        # 最小二乘圆拟合: min Σ[(x-a)²+(y-b)² - r²]²
+        A = np.column_stack([2 * pts_arr[:, 0], 2 * pts_arr[:, 1], np.ones(len(pts_arr))])
+        B = pts_arr[:, 0] ** 2 + pts_arr[:, 1] ** 2
+        
+        try:
+            sol, residuals, _rank, _sv = np.linalg.lstsq(A, B, rcond=None)
+            a, b_val, c = sol
+            r = np.sqrt(max(0.0, c + a ** 2 + b_val ** 2))
+            if 1.0 <= r <= min(w, h):
+                corner_radii.append(r)
+                rmse = float(np.sqrt(residuals[0] / len(pts_arr))) if len(residuals) > 0 else 0.0
+                errors.append(rmse)
+        except np.linalg.LinAlgError:
+            continue
+    
+    return corner_radii, errors
 
 # --- 渐变拟合（核心重构：自适应前置色彩孤立） ---
 def analyze_gradient_with_confidence(roi, accent_ratio_threshold: float = 0.3):
@@ -233,6 +276,9 @@ async def analyze_region(request: AnalyzeRegionRequest):
     img = load_image(request.image_source)
     h_img, w_img, _ = img.shape
     
+    # 输入校验：bbox 必须为 [ymin, xmin, ymax, xmax] 且值在 [0, 1000]
+    if len(request.bbox) != 4 or not all(0 <= v <= 1000 for v in request.bbox):
+        raise HTTPException(status_code=400, detail="bbox must be [ymin, xmin, ymax, xmax] in [0, 1000]")
     ymin_norm, xmin_norm, ymax_norm, xmax_norm = request.bbox
     ymin = int(ymin_norm / 1000.0 * h_img)
     xmin = int(xmin_norm / 1000.0 * w_img)
@@ -272,7 +318,7 @@ async def analyze_region(request: AnalyzeRegionRequest):
             "border_radius_px": radius,
             "color_type": color_info["type"],
             "gradient_css": color_info["gradient_css"],
-            "detected_shadow_blur_px": max(0, (xmax-xmin) - geo_box[2])
+            "detected_shadow_blur_px": None  # [approximate] shadow analysis not yet implemented — reserved for future
         },
         "metrics_summary": {
             "border_radius_confidence": radius_conf,
@@ -284,8 +330,9 @@ async def analyze_region(request: AnalyzeRegionRequest):
 @app.post("/measure_spacing")
 async def measure_spacing(request: MeasureSpacingRequest):
     boxes = request.bboxes
-    if len(boxes) < 2: 
-        return {"status": "success", "suggested_gap_x": 0, "suggested_gap_y": 0, "confidence": "high", "std_dev_x": 0.0}
+    if len(boxes) < 2:
+        return {"status": "success", "suggested_gap_x": 0, "suggested_gap_y": 0,
+                "metrics_summary": {"gap_confidence": "high", "std_deviation_x": 0.0, "std_deviation_y": 0.0}}
     
     gaps_x = []
     gaps_y = []
@@ -354,6 +401,80 @@ async def scan_global(request: ScanGlobalRequest):
             })
             
     return {"status": "success", "total_detected": len(detected_components), "components": detected_components}
+
+# --- 字体大小估算（形态学 + 轮廓分析，无 OCR 依赖） ---
+class DetectTextRequest(BaseModel):
+    image_source: str
+    bbox: Optional[list[int]] = None  # 可选局部区域 [ymin, xmin, ymax, xmax]
+
+
+def _estimate_text_sizes(roi):
+    """检测文本行并估算字号区间。返回按高度分组的层级表。"""
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    # OTSU 二值化
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # 形态学闭运算将文字聚合成行
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, gray.shape[1] // 30), 1))
+    lines_mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_h)
+    
+    contours, _ = cv2.findContours(lines_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    heights = []
+    for cnt in contours:
+        _x, _y, _w, h = cv2.boundingRect(cnt)
+        if 6 <= h <= 200 and _w > h * 1.5:  # 宽高比 > 1.5 视为文字行
+            heights.append(h)
+    
+    if not heights:
+        return {"heading": None, "body": None, "caption": None, "all_heights": []}
+    
+    heights = sorted(heights)
+    median_h = float(np.median(heights))
+    
+    # 按高度分三层
+    tier = {}
+    if max(heights) >= median_h * 1.3:
+        tier["heading"] = f"{int(np.percentile(heights, 90))}-{int(max(heights))}px"
+    else:
+        tier["heading"] = None
+    tier["body"] = f"{int(np.percentile(heights, 25))}-{int(np.percentile(heights, 75))}px"
+    if min(heights) <= median_h * 0.7:
+        tier["caption"] = f"{int(min(heights))}-{int(np.percentile(heights, 10))}px"
+    else:
+        tier["caption"] = None
+    
+    return {
+        "heading_range": tier["heading"],
+        "body_range": tier["body"],
+        "caption_range": tier["caption"],
+        "raw_heights_px": [int(h) for h in heights],
+        "median_height_px": int(median_h),
+        "confidence": "estimated"
+    }
+
+
+@app.post("/detect_text")
+async def detect_text(request: DetectTextRequest):
+    img = load_image(request.image_source)
+    h_img, w_img, _ = img.shape
+    
+    if request.bbox:
+        ymin_norm, xmin_norm, ymax_norm, xmax_norm = request.bbox
+        ymin = int(ymin_norm / 1000.0 * h_img)
+        xmin = int(xmin_norm / 1000.0 * w_img)
+        ymax = int(ymax_norm / 1000.0 * h_img)
+        xmax = int(xmax_norm / 1000.0 * w_img)
+        roi = img[max(0, ymin):min(ymax, h_img), max(0, xmin):min(xmax, w_img)]
+    else:
+        roi = img
+    
+    if roi.size == 0:
+        raise HTTPException(status_code=400, detail="区域映射失败，ROI 为空。")
+    
+    result = _estimate_text_sizes(roi)
+    return {"status": "success", "typography": result}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)

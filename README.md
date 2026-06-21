@@ -49,7 +49,7 @@ pip install fastapi uvicorn opencv-python numpy scikit-learn requests
 python .deepseek-orca/skills/framelore/image_analyzer_v4.py
 ```
 
-服务默认运行在 `http://127.0.0.1:8000`，提供三个端点：
+服务默认运行在 `http://127.0.0.1:8000`，提供四个端点：
 
 | 端点 | 功能 | 返回数据 |
 |------|------|---------|
@@ -57,6 +57,7 @@ python .deepseek-orca/skills/framelore/image_analyzer_v4.py
 | `POST /analyze_region` (mode=peak_accent) | 强调色峰值提取 | 饱和度 Top 5% 极值强调色、置信度 |
 | `POST /measure_spacing` | 间距度量 | 中位数间距、标准差、置信度 |
 | `POST /scan_global` | 全局盲扫 | 轮廓拓扑树、`parent_id` 层级关系 |
+| `POST /detect_text` | 字体大小估算 | 标题/正文/注释三级字号区间（px）、原始高度列表 |
 
 #### 未启动时的行为
 
