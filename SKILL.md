@@ -33,7 +33,7 @@ FrameLore 采用 **「VLM 语义锚定 + CV 物理探针」** 的双驱解耦架
 | `POST /analyze_region` (mode=kmeans) | `{image_source, bbox, mode}` <br>⚠️ *`bbox` 为 [ymin, xmin, ymax, xmax] 归一化空间* | K-Means 聚类提取背景主色/渐变分布，适合容器底色大面积区域。|
 | `POST /analyze_region` (mode=peak_accent) | 同上 | 饱和度 Top 5% 极值强调色提取，适合独立高亮控件（Badge/Tag/按钮）。|
 | `POST /measure_spacing` | `{bboxes:[[ymin, xmin, ymax, xmax], ...]}` | 物理间距计算，返回中位数间距、标准差及置信度。|
-| `POST /scan_global` | `{image_path}` | 获取全域组件的边缘轮廓与物理绝对坐标树。|
+| `POST /scan_global` | `{image_path}` | 全局轮廓检测，返回扁平组件列表（含 bbox、parent_id 层级关系）。已内置面积噪声过滤（< 0.3% 视口且无父容器的碎片自动丢弃）。|
 | `POST /detect_text` | `{image_source, bbox?}` | 形态学文字行检测，返回 heading/body/caption 字号区间（px）及原始高度列表。|
 
 ### 置信度数学定义

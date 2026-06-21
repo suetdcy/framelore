@@ -21,8 +21,18 @@ class EngineConfig:
     DARK_MODE_LUMINANCE_MAX = 85.0   
     COLOR_ACCENT_LUM_THRESHOLD = 100 
     
-    MIN_COMPONENT_SIZE = 12           
-    CANNY_SIGMA = 0.33               
+    MIN_COMPONENT_SIZE = 12           # 全局盲扫最小边长 (px)
+    MIN_COMPONENT_AREA_RATIO = 0.003  # 少于视口 0.3% 且无子节点 → 噪声
+    CANNY_SIGMA = 0.33
+
+    # KMeans 惯量/像素 → 色彩置信度
+    KMEANS_INERTIA_MEDIUM = 500.0    # 惯量/像素 > 此值 → medium
+    KMEANS_INERTIA_LOW = 1500.0      # 惯量/像素 > 此值 → low
+
+    # peak_accent 聚类内标准差 → 置信度
+    PEAK_STD_HIGH = 15.0             # 峰值聚类 std ≤ 此值 → high
+    PEAK_STD_MEDIUM = 30.0           # 峰值聚类 std ≤ 此值 → medium
+    PEAK_MIN_PIXELS = 10             # 最少有彩像素数               
 
     # 自适应色彩孤立空间阈值
     CHROMA_SAT_MIN = 40              # 过滤无彩灰/黑/白的最小饱和度门槛 (0-255)
@@ -176,8 +186,8 @@ def analyze_gradient_with_confidence(roi, accent_ratio_threshold: float = 0.3):
     kmeans = KMeans(n_clusters=n_clusters, n_init=5, random_state=42)
     kmeans.fit(target_pixels)
     
-    if kmeans.inertia_ / len(target_pixels) > 500: color_confidence = "medium"
-    if kmeans.inertia_ / len(target_pixels) > 1500: color_confidence = "low"
+    if kmeans.inertia_ / len(target_pixels) > EngineConfig.KMEANS_INERTIA_LOW: color_confidence = "low"
+    elif kmeans.inertia_ / len(target_pixels) > EngineConfig.KMEANS_INERTIA_MEDIUM: color_confidence = "medium"
         
     centers = kmeans.cluster_centers_
     labels_2d = kmeans.labels_ if not has_isolated_chroma else None
@@ -235,7 +245,7 @@ def peak_accent_extraction(roi):
     candidate_rgb = rgb_flat[mask]
     candidate_sat = hsv_flat[mask, 1]
     
-    if len(candidate_rgb) < 10:
+    if len(candidate_rgb) < EngineConfig.PEAK_MIN_PIXELS:
         # 没有足够有彩像素，回退到均值
         mean = np.mean(rgb_flat, axis=0)
         return '#{:02x}{:02x}{:02x}'.format(int(mean[0]), int(mean[1]), int(mean[2])), "low"
@@ -255,8 +265,17 @@ def peak_accent_extraction(roi):
     counts = np.bincount(kmeans.labels_)
     dominant = kmeans.cluster_centers_[np.argmax(counts)]
     
+    # 置信度：基于聚类内标准差（色值分散程度）
+    dominant_mask = (kmeans.labels_ == np.argmax(counts))
+    cluster_std = float(np.std(peak_pixels[dominant_mask], axis=0).mean())
+    if cluster_std <= EngineConfig.PEAK_STD_HIGH:
+        confidence = "high"
+    elif cluster_std <= EngineConfig.PEAK_STD_MEDIUM:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    
     hex_c = '#{:02x}{:02x}{:02x}'.format(int(dominant[0]), int(dominant[1]), int(dominant[2]))
-    confidence = "high" if len(peak_pixels) > 50 else "medium"
     return hex_c, confidence
 
 class AnalyzeRegionRequest(BaseModel):
@@ -392,6 +411,12 @@ async def scan_global(request: ScanGlobalRequest):
             xmin_norm = int(x / w_img * 1000)
             ymax_norm = int((y + h) / h_img * 1000)
             xmax_norm = int((x + w) / w_img * 1000)
+            
+            # 面积噪声过滤：小于 0.3% 视口且无父容器 → 丢弃
+            area_norm = (ymax_norm - ymin_norm) * (xmax_norm - xmin_norm)
+            area_ratio = area_norm / 1_000_000
+            if area_ratio < EngineConfig.MIN_COMPONENT_AREA_RATIO and parent_idx == -1:
+                continue
             
             detected_components.append({
                 "id": f"comp_{i}",
