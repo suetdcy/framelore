@@ -35,7 +35,7 @@ FrameLore 是一个基于多模态视觉模型 + 本地物理测量工具的 UI 
 
 ### 2. 本地 image-analyzer 工具（推荐启动以获得最佳精度）
 
-工具源码位于本目录 `attachments/` 下。
+工具源码位于本目录下。
 
 #### 安装
 
@@ -169,7 +169,7 @@ Copy-Item "中文路径/图片.png" $tmp -Force
 
 **原因**：多模态模型内部降采样处理 Retina 截图，输出的是逻辑视口尺寸而非物理像素。
 
-**解决**：启用归一化坐标空间（`[0, 1000]` 千分位坐标），由 `image-analyzer` 根据实际分辨率反算物理像素。详见 Runtime Hard Rule #8（The Gauge Invariant）。
+**解决**：启用归一化坐标空间（`[0, 1000]` 千分位坐标），由 `image-analyzer` 根据实际分辨率反算物理像素。详见 SKILL.md「报告输出红线」第 1 条（The Gauge Invariant）。
 
 ---
 
