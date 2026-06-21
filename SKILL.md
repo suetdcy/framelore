@@ -34,7 +34,9 @@ FrameLore 采用 **「VLM 语义锚定 + CV 物理探针」** 的双驱解耦架
 | `POST /analyze_region` (mode=peak_accent) | 同上 | 饱和度 Top 5% 极值强调色提取，适合独立高亮控件（Badge/Tag/按钮）。|
 | `POST /measure_spacing` | `{bboxes:[[ymin, xmin, ymax, xmax], ...]}` | 物理间距计算，返回中位数间距、标准差及置信度。|
 | `POST /scan_global` | `{image_path}` | 全局轮廓检测，返回扁平组件列表（含 bbox、parent_id 层级关系）。已内置面积噪声过滤（< 0.3% 视口且无父容器的碎片自动丢弃）。|
-| `POST /detect_text` | `{image_source, bbox?}` | 形态学文字行检测，返回 heading/body/caption 字号区间（px）及原始高度列表。|
+| `POST /detect_text` | `{image_source, bbox?}` | MSER 字符候选区提取 + 空间行分组，返回 heading/body/caption 字号区间（px）及每行高度列表。|
+| `POST /detect_overlay` | `{image_source}` | 全局直方图统计矩分析，检测半透明遮罩/弹窗/骨架屏。返回 overlay 存在性 + modal bbox 列表。|
+| `POST /fix_hierarchy` | `{components}` | 基于 IoA（交集占子节点面积比）修正 OpenCV hierarchy 的 parent_id 错误，返回修正后扁平列表 + 嵌套 children 树。|
 
 ### 置信度数学定义
 

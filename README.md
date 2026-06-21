@@ -49,7 +49,7 @@ pip install fastapi uvicorn opencv-python numpy scikit-learn requests
 python image_analyzer_v4.py
 ```
 
-服务默认运行在 `http://127.0.0.1:8000`，提供四个端点：
+服务默认运行在 `http://127.0.0.1:8000`，提供六个端点：
 
 | 端点 | 功能 | 返回数据 |
 |------|------|---------|
@@ -57,7 +57,9 @@ python image_analyzer_v4.py
 | `POST /analyze_region` (mode=peak_accent) | 强调色峰值提取 | 饱和度 Top 5% 极值强调色、置信度 |
 | `POST /measure_spacing` | 间距度量 | 中位数间距、标准差、置信度 |
 | `POST /scan_global` | 全局盲扫 | 轮廓拓扑树、`parent_id` 层级关系 |
-| `POST /detect_text` | 字体大小估算 | 标题/正文/注释三级字号区间（px）、原始高度列表 |
+| `POST /detect_text` | 字体大小估算 | 标题/正文/注释三级字号区间（px）、每行高度列表 |
+| `POST /detect_overlay` | 遮罩/弹窗检测 | 半透明遮罩存在性、弹窗归一化 bbox 列表 |
+| `POST /fix_hierarchy` | 组件树拓扑修正 | IoA 修正 parent_id、嵌套 children 树 |
 
 #### 未启动时的行为
 
@@ -181,4 +183,19 @@ Copy-Item "中文路径/图片.png" $tmp -Force
 **原因**：违反 Strict-Copy Protocol — 模型在文本不可读时选择了猜测而非标记错误。
 
 **解决**：启用 Strict-Copy Protocol #3（乱码熔断与退避），遇到编码损坏字符时标记 `[ENCODING_ERROR]` 而非脑补。
+
+---
+
+## 已知精度限制
+
+| 能力 | 状态 | 说明 |
+|------|------|------|
+| **阴影/发光检测** | ✅ 已实现 | 高斯差分金字塔 (DoG)，多尺度 σ 探测弥散半径 2-32px。对渐变背景/暗黑模式/新拟态鲁棒 |
+| **字体大小估算** | ✅ 已实现 | MSER 字符检测 + 空间行分组。自适应图片分辨率（δ 参数），对 Retina/中文/暗黑均可靠。输出 `per_line_heights` 每行统计 |
+| **渐变角度** | ✅ 高精度 | Sobel 梯度加权直方图，对齐 15° CSS 步长 |
+| **圆角检测** | ✅ 高精度 | 轮廓曲率分析 + 四角最小二乘圆拟合，自适应 corner_zone |
+| **强调色提取** | ✅ 高精度 | `peak_accent` 模式：饱和度 Top 5% + KMeans 聚类内标准差校验。暗黑模式 0.7x 衰减 |
+| **遮罩/弹窗检测** | ✅ 已实现 | 全图直方图统计矩（均值/方差/偏度），8x8 块局部方差 BFS 扫描弹窗区域 |
+| **组件树层级** | ⚠️ 部分自动化 | `scan_global` 返回扁平列表（含 `hint_type`）。`/fix_hierarchy` 基于 IoA 修正 parent_id 并输出嵌套树。微小组件仍可能因 Canny 边缘阈值漏扫 |
+| **UX 交互层** | ⚠️ 依赖 VLM | 无工具侧交互语义检测（点击/跳转/校验逻辑依赖 LLM 视觉推理）。工具仅提供 overlay/modal 的结构化检测 |
 

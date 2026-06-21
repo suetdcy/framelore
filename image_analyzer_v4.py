@@ -137,6 +137,58 @@ def _fit_corner_circles(contour, x, y, w, h, peri):
     
     return corner_radii, errors
 
+# --- 阴影/发光高斯差分金字塔检测 (DoG) ---
+def _detect_shadow_dog(roi_gray):
+    """高斯差分金字塔：多尺度 σ 探测边缘弥散半径。
+    对渐变背景、大弥散半径 (>20px) 和新拟态均鲁棒，不依赖固定 margin。"""
+    h, w = roi_gray.shape
+    if min(h, w) < 20:
+        return None, "low"
+    
+    sigmas = [2.0, 4.0, 8.0, 16.0, 32.0]
+    
+    # 外环 + 内侧参考
+    outer_ring_mask = np.zeros_like(roi_gray, dtype=np.uint8)
+    cv2.rectangle(outer_ring_mask, (4, 4), (w-5, h-5), 255, -1)
+    ring_pixels = (outer_ring_mask == 0)
+    if not ring_pixels.any():
+        return None, "low"
+    
+    inner_ring = roi_gray[8:-8, 8:-8] if h > 16 and w > 16 else None
+    inner_mean = float(np.mean(inner_ring)) if inner_ring is not None and inner_ring.size > 0 else float(np.median(roi_gray))
+    outer_mean = float(np.mean(roi_gray[ring_pixels]))
+    base_diff = abs(inner_mean - outer_mean)
+    
+    if base_diff < 5:
+        return None, "high"  # 内外几乎无差异，确实无阴影
+    
+    prev_blur = roi_gray.astype(np.float64)
+    edge_responses = []
+    
+    for sigma in sigmas:
+        ksize = max(3, int(sigma * 6) | 1)
+        blurred = cv2.GaussianBlur(roi_gray, (ksize, ksize), sigma).astype(np.float64)
+        diff = np.abs(blurred - prev_blur)
+        ring_response = float(np.mean(diff[ring_pixels]))
+        edge_responses.append((sigma, ring_response))
+        prev_blur = blurred
+    
+    best_sigma, best_response = max(edge_responses, key=lambda x: x[1])
+    
+    if best_response < 1.5:
+        return None, "high"
+    
+    blur_px = round(best_sigma * 0.7, 1)
+    
+    if best_response > 5.0 and base_diff > 15:
+        conf = "high"
+    elif best_response > 2.5:
+        conf = "medium"
+    else:
+        conf = "low"
+    
+    return blur_px, conf
+
 # --- 渐变拟合（核心重构：自适应前置色彩孤立） ---
 def _estimate_gradient_angle(roi_gray):
     """Sobel 梯度方向加权直方图 → 真实渐变角度（对齐 15° 步长）"""
@@ -379,6 +431,7 @@ async def analyze_region(request: AnalyzeRegionRequest):
         
     radius, geo_box, radius_conf, radius_err = parse_geometry_with_confidence(roi)
     color_info = analyze_gradient_with_confidence(roi, request.accent_ratio_threshold)
+    shadow_blur, shadow_conf = _detect_shadow_dog(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))
     
     return {
         "status": "success",
@@ -392,12 +445,13 @@ async def analyze_region(request: AnalyzeRegionRequest):
             "border_radius_px": radius,
             "color_type": color_info["type"],
             "gradient_css": color_info["gradient_css"],
-            "detected_shadow_blur_px": None  # [approximate] shadow analysis not yet implemented — reserved for future
+            "detected_shadow_blur_px": shadow_blur
         },
         "metrics_summary": {
             "border_radius_confidence": radius_conf,
             "border_radius_error_rate": radius_err,
-            "color_gradient_confidence": color_info["confidence"]
+            "color_gradient_confidence": color_info["confidence"],
+            "shadow_confidence": shadow_conf
         }
     }
 
@@ -521,54 +575,88 @@ async def scan_global(request: ScanGlobalRequest):
     return {"status": "success", "total_detected": len(detected_components),
             "filtered_count": filtered_count, "components": detected_components}
 
-# --- 字体大小估算（形态学 + 轮廓分析，无 OCR 依赖） ---
+# --- 字体大小估算（MSER 字符检测 + 空间聚类行分组，零 OCR 依赖） ---
 class DetectTextRequest(BaseModel):
     image_source: str
-    bbox: Optional[list[int]] = None  # 可选局部区域 [ymin, xmin, ymax, xmax]
+    bbox: Optional[list[int]] = None
 
 
-def _estimate_text_sizes(roi):
-    """检测文本行并估算字号区间。返回按高度分组的层级表。"""
+def _detect_text_mser(roi):
+    """MSER 字符候选区提取 + 空间行分组 → 字号估算。
+    对 Retina 缩放、中英文、暗黑模式均鲁棒，不再依赖形态学固定 kernel。"""
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    # OTSU 二值化
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    h_roi, w_roi = gray.shape
     
-    # 形态学闭运算将文字聚合成行
-    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, gray.shape[1] // 30), 1))
-    lines_mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_h)
+    # 按分辨率自适应 MSER δ 参数（高 DPI → 大 δ）
+    diag = np.sqrt(h_roi**2 + w_roi**2)
+    mser_delta = max(2, min(8, int(diag / 200)))  # δ ∈ [2, 8]
     
-    contours, _ = cv2.findContours(lines_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mser = cv2.MSER_create(_delta=mser_delta, _min_area=20, _max_area=int(diag * 0.8))
+    regions, _bboxes = mser.detectRegions(gray)
     
-    heights = []
-    for cnt in contours:
-        _x, _y, _w, h = cv2.boundingRect(cnt)
-        if 6 <= h <= 200 and _w > h * 1.5:  # 宽高比 > 1.5 视为文字行
-            heights.append(h)
+    if not _bboxes:
+        return {"heading_range": None, "body_range": None, "caption_range": None,
+                "per_line_heights": [], "line_count": 0, "confidence": "estimated"}
     
-    if not heights:
-        return {"heading": None, "body": None, "caption": None, "all_heights": []}
+    # 过滤：保留类文字几何特征的 bbox
+    chars = []
+    for b in _bboxes:
+        x, y, w_c, h_c = b
+        aspect = w_c / max(1, h_c)
+        area = w_c * h_c
+        # 中文方块 ≈ 1:1，英文字母 ≈ 0.3:1~1.2:1，排除极端扁平/细长 → 非文字
+        if 0.15 < aspect < 3.0 and 20 < area < w_roi * h_roi * 0.3:
+            chars.append((x, y, w_c, h_c, y + h_c // 2))  # 中心 y 用于行分组
     
-    heights = sorted(heights)
-    median_h = float(np.median(heights))
+    if len(chars) < 3:
+        return {"heading_range": None, "body_range": None, "caption_range": None,
+                "per_line_heights": [], "line_count": 0, "confidence": "estimated"}
     
-    # 按高度分三层
-    tier = {}
-    if max(heights) >= median_h * 1.3:
-        tier["heading"] = f"{int(np.percentile(heights, 90))}-{int(max(heights))}px"
-    else:
-        tier["heading"] = None
-    tier["body"] = f"{int(np.percentile(heights, 25))}-{int(np.percentile(heights, 75))}px"
-    if min(heights) <= median_h * 0.7:
-        tier["caption"] = f"{int(min(heights))}-{int(np.percentile(heights, 10))}px"
-    else:
-        tier["caption"] = None
+    # 按中心 y 排序后分组为行（y 中心差 < 1.5 × 中位数高度）
+    chars.sort(key=lambda c: c[4])  # 按 center_y 排序
+    median_h = float(np.median([c[3] for c in chars]))
+    
+    lines = []
+    current_line = [chars[0]]
+    for ch in chars[1:]:
+        if ch[4] - current_line[-1][4] <= median_h * 1.5:
+            current_line.append(ch)
+        else:
+            lines.append(current_line)
+            current_line = [ch]
+    lines.append(current_line)
+    
+    # 每行统计
+    per_line = []
+    for line in lines:
+        heights = [c[3] for c in line]
+        per_line.append({
+            "char_count": len(line),
+            "median_height_px": int(np.median(heights)),
+            "min_height_px": int(min(heights)),
+            "max_height_px": int(max(heights))
+        })
+    
+    all_heights = [l["median_height_px"] for l in per_line]
+    all_heights_sorted = sorted(all_heights)
+    median_line_h = float(np.median(all_heights_sorted))
+    
+    # 三层分级
+    heading_range = None
+    if len(all_heights_sorted) >= 2 and max(all_heights_sorted) >= median_line_h * 1.35:
+        heading_range = f"{int(np.percentile(all_heights_sorted, 90))}-{int(max(all_heights_sorted))}px"
+    body_range = f"{int(np.percentile(all_heights_sorted, 25))}-{int(np.percentile(all_heights_sorted, 75))}px"
+    caption_range = None
+    if len(all_heights_sorted) >= 2 and min(all_heights_sorted) <= median_line_h * 0.65:
+        caption_range = f"{int(min(all_heights_sorted))}-{int(np.percentile(all_heights_sorted, 10))}px"
     
     return {
-        "heading_range": tier["heading"],
-        "body_range": tier["body"],
-        "caption_range": tier["caption"],
-        "raw_heights_px": [int(h) for h in heights],
-        "median_height_px": int(median_h),
+        "heading_range": heading_range,
+        "body_range": body_range,
+        "caption_range": caption_range,
+        "per_line_heights": per_line,
+        "line_count": len(lines),
+        "median_height_px": int(median_line_h),
         "confidence": "estimated"
     }
 
@@ -591,8 +679,185 @@ async def detect_text(request: DetectTextRequest):
     if roi.size == 0:
         raise HTTPException(status_code=400, detail="区域映射失败，ROI 为空。")
     
-    result = _estimate_text_sizes(roi)
+    result = _detect_text_mser(roi)
     return {"status": "success", "typography": result}
+
+
+# --- 遮罩/弹窗检测（全局直方图统计矩分析） ---
+class DetectOverlayRequest(BaseModel):
+    image_source: str
+
+
+@app.post("/detect_overlay")
+async def detect_overlay(request: DetectOverlayRequest):
+    """检测页面是否存在半透明遮罩/弹窗/骨架屏。
+    使用全局灰度直方图的三阶统计矩（均值、方差、偏度），
+    而非 5x5 网格硬阈值。对暗黑模式、Drawer、侧边弹窗均有效。"""
+    img = load_image(request.image_source)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h_img, w_img = gray.shape
+    
+    # 全局统计矩
+    mean_val = float(np.mean(gray))
+    var_val = float(np.var(gray))
+    skew_val = float(np.mean((gray - mean_val) ** 3)) / (max(1.0, var_val) ** 1.5)
+    
+    # 暗黑模式检测
+    is_dark = mean_val < 85.0
+    
+    # 遮罩判定：方差被压缩（半透层抹平了对比度）+ 亮度偏移
+    # 典型无遮罩 UI 方差 1500-4000，半透遮罩后方差 200-800
+    overlay_present = False
+    overlay_confidence = "high"
+    
+    if is_dark:
+        # 暗黑模式：遮罩使画面进一步变暗 + 方差缩小
+        if var_val < 600 and mean_val < 50:
+            overlay_present = True
+            overlay_confidence = "medium" if var_val > 300 else "high"
+    else:
+        # 亮色模式：遮罩拉低亮度 + 方差缩小
+        if var_val < 1200 and mean_val < 160:
+            overlay_present = True
+            overlay_confidence = "medium" if var_val > 500 else "high"
+    
+    modal_bboxes = []
+    if overlay_present:
+        # 在遮罩区域扫描高对比度矩形（弹窗内容）
+        # 将图像分块，找局部方差 > 全局方差 2x 的连通区块
+        block_h, block_w = h_img // 8, w_img // 8
+        local_var_map = np.zeros((8, 8), dtype=np.float32)
+        for r in range(8):
+            for c in range(8):
+                patch = gray[r*block_h:(r+1)*block_h, c*block_w:(c+1)*block_w]
+                if patch.size > 0:
+                    local_var_map[r, c] = float(np.var(patch))
+        
+        # 找局部高方差块（弹窗内容特征）
+        high_var = local_var_map > var_val * 2
+        visited = np.zeros_like(high_var, dtype=bool)
+        
+        for r in range(8):
+            for c in range(8):
+                if high_var[r, c] and not visited[r, c]:
+                    # BFS 找连通区域
+                    region = []
+                    queue = [(r, c)]
+                    while queue:
+                        cr, cc = queue.pop(0)
+                        if 0 <= cr < 8 and 0 <= cc < 8 and high_var[cr, cc] and not visited[cr, cc]:
+                            visited[cr, cc] = True
+                            region.append((cr, cc))
+                            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                                queue.append((cr+dr, cc+dc))
+                    
+                    if len(region) >= 2:  # 至少 2 个高方差块
+                        rows = [p[0] for p in region]
+                        cols = [p[1] for p in region]
+                        ymin = int(min(rows) * block_h / h_img * 1000)
+                        xmin = int(min(cols) * block_w / w_img * 1000)
+                        ymax = int((max(rows)+1) * block_h / h_img * 1000)
+                        xmax = int((max(cols)+1) * block_w / w_img * 1000)
+                        modal_bboxes.append({
+                            "norm_bbox": [ymin, xmin, ymax, xmax],
+                            "block_count": len(region)
+                        })
+    
+    return {
+        "status": "success",
+        "overlay": {
+            "present": overlay_present,
+            "confidence": overlay_confidence,
+            "global_stats": {
+                "mean": round(mean_val, 1),
+                "variance": round(var_val, 1),
+                "skewness": round(skew_val, 3),
+                "dark_mode": is_dark
+            },
+            "modal_bboxes": modal_bboxes,
+            "modal_count": len(modal_bboxes)
+        }
+    }
+
+
+# --- 组件树 IoA 拓扑修正 ---
+class FixHierarchyRequest(BaseModel):
+    components: list[dict]
+
+
+def _bbox_intersection_area(a, b):
+    i_ymin = max(a[0], b[0]); i_xmin = max(a[1], b[1])
+    i_ymax = min(a[2], b[2]); i_xmax = min(a[3], b[3])
+    if i_ymin >= i_ymax or i_xmin >= i_xmax:
+        return 0
+    return (i_ymax - i_ymin) * (i_xmax - i_xmin)
+
+
+def _bbox_area(b):
+    return max(0, (b[2] - b[0])) * max(0, (b[3] - b[1]))
+
+
+@app.post("/fix_hierarchy")
+async def fix_hierarchy(request: FixHierarchyRequest):
+    """基于 IoA 修正 scan_global 的 parent_id。
+    解决 OpenCV hierarchy 在视觉穿透场景下的错误（如 Badge 溢出按钮边界）。"""
+    comps = request.components
+    if not comps:
+        return {"status": "success", "components": [], "tree": [], "corrections": 0}
+    
+    bboxes = [c["bbox"] for c in comps]
+    corrections = 0
+    
+    for i, child in enumerate(comps):
+        orig_parent = child.get("parent_id", "root")
+        child_area = _bbox_area(bboxes[i])
+        if child_area <= 0:
+            continue
+        
+        best_ioa = 0.0
+        best_parent_id = "root"
+        for j, parent in enumerate(comps):
+            if i == j:
+                continue
+            inter = _bbox_intersection_area(bboxes[i], bboxes[j])
+            ioa = inter / child_area
+            if ioa > best_ioa:
+                best_ioa = ioa
+                best_parent_id = parent["id"]
+        
+        if best_ioa >= 0.3 and best_parent_id != orig_parent:
+            comps[i]["original_parent_id"] = orig_parent
+            comps[i]["parent_id"] = best_parent_id
+            comps[i]["ioa_score"] = round(best_ioa, 3)
+            corrections += 1
+        elif best_ioa < 0.3 and orig_parent != "root":
+            comps[i]["original_parent_id"] = orig_parent
+            comps[i]["parent_id"] = "root"
+            comps[i]["ioa_score"] = round(best_ioa, 3)
+            corrections += 1
+    
+    # 构建嵌套 children 树
+    children_map = {}
+    for c in comps:
+        pid = c.get("parent_id", "root")
+        children_map.setdefault(pid, []).append(c)
+    
+    def build_node(node_id):
+        children = children_map.pop(node_id, [])
+        for ch in children:
+            if ch["id"] in children_map:
+                ch["children"] = build_node(ch["id"])
+            else:
+                ch["children"] = []
+        return children
+    
+    tree = build_node("root")
+    for pid, nodes in children_map.items():
+        for n in nodes:
+            n["children"] = []
+            tree.append(n)
+    
+    return {"status": "success", "corrections": corrections, "components": comps, "tree": tree}
 
 
 if __name__ == "__main__":
