@@ -38,6 +38,8 @@ FrameLore 采用 **「VLM 语义锚定 + CV 物理探针」** 的双驱解耦架
 | `POST /detect_overlay` | `{image_source}` | 全局直方图统计矩分析，检测半透明遮罩/弹窗/骨架屏。返回 overlay 存在性 + modal bbox 列表。|
 | `POST /fix_hierarchy` | `{components}` | 基于 IoA（交集占子节点面积比）修正 OpenCV hierarchy 的 parent_id 错误，返回修正后扁平列表 + 嵌套 children 树。|
 
+**OCR 分工**：`/detect_text` 仅提供字号区间（物理量），不识别文字内容。所有 UI 文字内容由 VLM vision API（qwen-vl-max / gpt-4o）的 `content[0].text` 直接提取。两路数据独立，各不互扰。
+
 ### 置信度数学定义
 
 **圆角置信度 (Border Radius Confidence)** — 霍夫圆变换/轮廓曲率拟合 RMSE：
@@ -146,16 +148,24 @@ FrameLore 采用 **「VLM 语义锚定 + CV 物理探针」** 的双驱解耦架
 
 ## 🖱️ UX 交互层提取规则
 
-静态截图可提取的 UX 信息有限但可验证。仅提取**视觉可见**的交互线索，禁止推测不可见行为。
+从已获得的物理数据出发，按以下映射表推断 UX 层级。每一项都绑定具体工具返回值——**LLM 看到什么物理数据，就填什么 UX 结论**，无数据直接降级为 `[]` 或 `null`。
 
-1. **导航识别**：扫描顶部/侧边区域的导航控件，判定类型（Tab/Breadcrumb/SideNav/TopBar），记录当前激活项的文字。
-2. **弹窗/浮层**：检测页面内是否存在高 z-index 视觉特征（居中卡片+背景半透明遮罩、右滑抽屉、底部面板）。提取弹窗标题文字（Strict-Copy）。
-3. **状态指示器**：检测加载态（骨架屏 gray blocks / Spinner 图标 / 进度条）、空状态（居中图标+提示文字）、禁用态（灰色文字/降低对比度的控件）。
-4. **可点击计数**：统计按钮、链接、可点击卡片的总数。此计数来自 scan_global 组件经 LLM 分类后的汇总。
+### 物理数据 → UX 推断映射表
 
-**约束**：
-- 未检测到的字段填入空数组 `[]` 或 `null`，不得编造。
-- 不得推断「点击后跳转到某页面」——仅记录当前帧可见内容。
+| UX 输出字段 | 物理证据（工具数据源） | 判定模式 | 无数据降级 |
+|-----------|----------------------|---------|----------|
+| `page_flow.navigation_type` | `scan_global` 中顶部区域 `hint_type: "text"` 水平排列 ≥ 2 条 + VLM 视觉判定其间距一致、字号相同 | 判定为 `Tabs`；若呈层级缩进则为 `Breadcrumb`；若在左侧垂直排列则为 `SideNav`；若仅 1 条居中则为 `TopBar` | `"无"` |
+| `page_flow.active_section` | VLM vision API 在导航区域内判定当前高亮的标签文字 | Strict-Copy 原文 | `null` |
+| `interactive_states.visible_modals` | `/detect_overlay` 返回 `present: true` + `modal_bboxes` 非空 + VLM 在弹窗区域内提取标题文字 | 每个弹窗填 `{ title: Strict-Copy, norm_bbox: [ymin,xmin,ymax,xmax] }` | `[]` |
+| `interactive_states.loading_indicators` | `/detect_overlay` 返回 `variance < 暗黑基准 600` 且无 modal → 全图低对比度 → 骨架屏；VLM 视觉发现 Spinner 图标 → 加载转圈 | 填入 `["skeleton"]` 或 `["spinner"]` 或 `["progress_bar"]` | `[]` |
+| `interactive_states.empty_states` | VLM 视觉在内容区中心发现孤立图标 + 提示文字（如 "暂无数据"） | 填入 `[{ icon_desc: "...", text: Strict-Copy }]` | `[]` |
+| `interaction_cues.clickable_count` | `scan_global` 中 `hint_type` 为 `"card"` `"button"` 的总数 + VLM 补充判定可点击链接 | 工具计数 + VLM 补计 | `0` |
+| `interaction_cues.disabled_controls` | `scan_global` 中 `hint_type: "text"` 且 VLM 判定其颜色为灰色/低对比度 | 填入 `[{ text: Strict-Copy, norm_bbox }]` | `[]` |
+
+**强制规则**：
+- 禁止根据「设计常识」推断任何 UX 行为——只填表中列出的字段，只依据表中指定的物理证据。
+- VLM 提取的弹窗/空状态/导航标题文字必须执行 Strict-Copy（字节级精确）。
+- UX 层数据全部填入报告第 5 段，未检测到的字段留存空数组或 `null`，不得编造。
 
 ---
 
@@ -229,17 +239,29 @@ triggered_rules:
 ```yaml
 ux_layer:
   page_flow:
-    navigation_type: "{TopBar / SideNav / Tabs / Breadcrumb / 无}"
-    active_section: "{当前高亮的导航项名称}"
+    # 数据源: scan_global 顶部 text 组件 + VLM 导航判定
+    navigation_type: "{Tabs / Breadcrumb / SideNav / TopBar / 无}"
+    active_section: "{VLM 从导航栏提取的高亮项文字 — Strict-Copy}"
   
   interactive_states:
-    visible_modals: []       # 可见弹窗/抽屉列表（Strict-Copy 标题文字）
-    loading_indicators: []   # 骨架屏/Spinner/进度条
-    empty_states: []         # 空状态占位图文
+    # 数据源: /detect_overlay 返回 present + modal_bboxes
+    visible_modals:
+      - title: "{VLM 从弹窗内提取的标题 — Strict-Copy}"
+        norm_bbox: [ymin, xmin, ymax, xmax]
+    # 数据源: /detect_overlay 返回 variance < 基准值 且无 modal
+    loading_indicators: []   # ["skeleton"] / ["spinner"] / ["progress_bar"]
+    # 数据源: VLM 视觉在内容区中心发现孤立图标 + 提示文字
+    empty_states:
+      - icon_desc: "{VLM 描述的图标特征}"
+        text: "{Strict-Copy 提示文字}"
   
   interaction_cues:
-    clickable_count: {int}   # 可点击控件总数（按钮+链接+卡片）
-    disabled_controls: []    # 灰色/不可用控件列表
+    # 数据源: scan_global 中 hint_type: "card"/"button" 总数 + VLM 补计链接
+    clickable_count: {int}
+    # 数据源: scan_global 中 hint_type: "text" + VLM 判定灰色/低对比度
+    disabled_controls:
+      - text: "{Strict-Copy 原文}"
+        norm_bbox: [ymin, xmin, ymax, xmax]
 ```
 ```
 
