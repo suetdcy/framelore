@@ -53,7 +53,8 @@ python .deepseek-orca/skills/framelore/image_analyzer_v4.py
 
 | 端点 | 功能 | 返回数据 |
 |------|------|---------|
-| `POST /analyze_region` | 微观像素解析 | 色值、渐变CSS、圆角px、阴影模糊、置信度 |
+| `POST /analyze_region` (mode=kmeans) | K-Means 背景/渐变提取 | 容器底色、渐变分布、圆角px、置信度 |
+| `POST /analyze_region` (mode=peak_accent) | 强调色峰值提取 | 饱和度 Top 5% 极值强调色、置信度 |
 | `POST /measure_spacing` | 间距度量 | 中位数间距、标准差、置信度 |
 | `POST /scan_global` | 全局盲扫 | 轮廓拓扑树、`parent_id` 层级关系 |
 
